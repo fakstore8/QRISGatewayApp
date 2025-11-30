@@ -1,0 +1,1448 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>QRIS Gateway Pro - Simulasi Aplikasi</title>
+    
+    <script src="https://cdn.tailwindcss.com"></script>
+
+    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    
+    <style>
+        /* Mengatasi masalah tinggi di mobile/desktop */
+        #root {
+            min-height: 100vh;
+        }
+        /* Style untuk scrollbar pada modal/form panjang */
+        .overflow-y-auto::-webkit-scrollbar {
+            width: 8px;
+        }
+        .overflow-y-auto::-webkit-scrollbar-thumb {
+            background-color: rgba(156, 163, 175, 0.7); /* gray-400 */
+            border-radius: 4px;
+        }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        // Import manual komponen ikon Lucide yang digunakan
+        const { QrCode, Users, Wallet, Plus, Edit, Trash2, Eye, Download, Copy, Check, Settings, ArrowLeft, Search, Filter, LogIn, UserPlus, LogOut } = lucide;
+
+        const { useState, useEffect } = React;
+
+        // ============================================
+        // CONFIGURATION
+        // ============================================
+        const CONFIG = {
+          APP_NAME: "QRIS Gateway Pro",
+          ADMIN_FEE_PERCENT: 2.5,
+          MIN_TRANSACTION: 1000,
+        };
+
+        // ============================================
+        // UTILITIES
+        // ============================================
+        const Utils = {
+          formatCurrency: (amount) => {
+            const numericAmount = Number(amount);
+            return new Intl.NumberFormat('id-ID', {
+              style: 'currency',
+              currency: 'IDR',
+              minimumFractionDigits: 0
+            }).format(numericAmount);
+          },
+          
+          generateId: () => {
+            return Date.now().toString(36) + Math.random().toString(36).substr(2);
+          },
+          
+          calculateFee: (amount, feePercent = CONFIG.ADMIN_FEE_PERCENT) => {
+            return Math.round(Number(amount) * feePercent / 100);
+          },
+
+          generateCustomQRIS: (masterQRIS, clientName, amount, transactionId) => {
+            // Implementasi sederhana untuk simulasi modifikasi QRIS
+            let modifiedQRIS = masterQRIS;
+            
+            // 1. Find and replace merchant name (Field 59)
+            const merchantNameRegex = /59\d{2}([A-Za-z0-9\s\.\/]+?)60/; 
+            
+            const clientNameClean = clientName.substring(0, 25);
+            const newLength = clientNameClean.length.toString().padStart(2, '0');
+            
+            modifiedQRIS = modifiedQRIS.replace(merchantNameRegex, `59${newLength}${clientNameClean}60`);
+            
+            // 2. Add amount field (Field 54)
+            const amountStr = String(amount);
+            const amountLength = amountStr.length.toString().padStart(2, '0');
+            
+            modifiedQRIS = modifiedQRIS.replace(/54\d{2}\d+/, '');
+            
+            const insertPos = modifiedQRIS.search(/5[238]\d{2}/);
+            if (insertPos > 0) {
+              modifiedQRIS = modifiedQRIS.slice(0, insertPos) + 
+                             `54${amountLength}${amountStr}` + 
+                             modifiedQRIS.slice(insertPos);
+            }
+            
+            // 3. Recalculate CRC (Field 63) - Simple checksum simulation
+            modifiedQRIS = modifiedQRIS.replace(/63\d{4}$/, ''); 
+            
+            const crcSource = modifiedQRIS + '6304';
+            let sum = 0;
+            for (let i = 0; i < crcSource.length; i++) {
+                sum += crcSource.charCodeAt(i);
+            }
+            const simulatedCrc = (sum % 9999).toString(16).toUpperCase().padStart(4, '0');
+            
+            modifiedQRIS += `6304${simulatedCrc}`;
+            
+            return modifiedQRIS;
+          },
+
+          hashPassword: (password) => {
+            return btoa(password + 'qris-salt');
+          }
+        };
+
+        // ============================================
+        // STORAGE MANAGER
+        // ============================================
+        const Storage = {
+          getMasterSettings: () => {
+            const data = localStorage.getItem('master_settings');
+            return data ? JSON.parse(data) : {
+              merchantName: 'FakhriMaulanaJanuar',
+              masterQRIS: '00020101021126570011ID.DANA.WWW011893600915387035007902098703500790303UMI51440014ID.CO.QRIS.WWW0215ID10253916655810303UMI5204481453033605802ID5919FakhriMaulanaJanuar6013Kab. Lumajang6105673166304FBB5',
+              adminFee: CONFIG.ADMIN_FEE_PERCENT,
+              accountNumber: '1234567890',
+              bankName: 'DANA',
+              adminPassword: Utils.hashPassword('admin123')
+            };
+          },
+          
+          saveMasterSettings: (settings) => {
+            localStorage.setItem('master_settings', JSON.stringify(settings));
+          },
+
+          getClients: () => {
+            const data = localStorage.getItem('qris_clients');
+            return data ? JSON.parse(data) : [];
+          },
+          
+          saveClients: (clients) => {
+            localStorage.setItem('qris_clients', JSON.stringify(clients));
+          },
+
+          getTransactions: () => {
+            const data = localStorage.getItem('qris_transactions');
+            return data ? JSON.parse(data) : [];
+          },
+          
+          saveTransaction: (transaction) => {
+            const transactions = Storage.getTransactions();
+            transactions.unshift(transaction);
+            localStorage.setItem('qris_transactions', JSON.stringify(transactions));
+          },
+
+          updateTransaction: (id, updates) => {
+            const transactions = Storage.getTransactions();
+            const updated = transactions.map(t => t.id === id ? {...t, ...updates} : t);
+            localStorage.setItem('qris_transactions', JSON.stringify(updated));
+          }
+        };
+
+        // ============================================
+        // MAIN APP COMPONENT
+        // ============================================
+        function QRISGatewayApp() {
+          const [userType, setUserType] = useState(null); // 'admin' or 'client'
+          const [currentUser, setCurrentUser] = useState(null);
+          const [view, setView] = useState('login');
+          const [masterSettings, setMasterSettings] = useState(Storage.getMasterSettings());
+          const [clients, setClients] = useState(Storage.getClients());
+          const [transactions, setTransactions] = useState(Storage.getTransactions());
+          const [selectedClient, setSelectedClient] = useState(null);
+          const [showModal, setShowModal] = useState(false);
+          const [modalType, setModalType] = useState('');
+          
+          useEffect(() => {
+            setMasterSettings(Storage.getMasterSettings());
+            setClients(Storage.getClients());
+            setTransactions(Storage.getTransactions());
+          }, []);
+
+          // Form states
+          const [loginForm, setLoginForm] = useState({
+            username: '',
+            password: ''
+          });
+
+          const [registerForm, setRegisterForm] = useState({
+            name: '',
+            businessName: '',
+            phone: '',
+            email: '',
+            address: '',
+            password: '',
+            confirmPassword: ''
+          });
+
+          const [qrisForm, setQrisForm] = useState({
+            amount: '',
+            description: ''
+          });
+
+          const [searchTerm, setSearchTerm] = useState('');
+
+          // Calculate statistics
+          const stats = {
+            totalClients: clients.length,
+            activeClients: clients.filter(c => c.status === 'active').length,
+            totalTransactions: transactions.length,
+            totalRevenue: transactions.reduce((sum, t) => sum + (t.status === 'success' ? t.netAmount : 0), 0),
+            totalFees: transactions.reduce((sum, t) => sum + (t.status === 'success' ? t.adminFee : 0), 0),
+            pendingTransactions: transactions.filter(t => t.status === 'pending').length
+          };
+
+          // Client-specific stats
+          const clientStats = currentUser && userType === 'client' ? {
+            myTransactions: transactions.filter(t => t.clientId === currentUser.id),
+            totalRevenue: transactions
+              .filter(t => t.clientId === currentUser.id && t.status === 'success')
+              .reduce((sum, t) => sum + t.netAmount, 0),
+            pendingCount: transactions.filter(t => t.clientId === currentUser.id && t.status === 'pending').length,
+            successCount: transactions.filter(t => t.clientId === currentUser.id && t.status === 'success').length
+          } : null;
+
+          // ============================================
+          // AUTHENTICATION
+          // ============================================
+          const handleAdminLogin = () => {
+            if (loginForm.username === 'admin' && Utils.hashPassword(loginForm.password) === masterSettings.adminPassword) {
+              setUserType('admin');
+              setCurrentUser({ username: 'admin', role: 'admin' });
+              setView('dashboard');
+              setLoginForm({ username: '', password: '' });
+            } else {
+              alert('Username atau password admin salah!');
+            }
+          };
+
+          const handleClientLogin = () => {
+            const client = clients.find(c => 
+              c.email.toLowerCase() === loginForm.username.toLowerCase() && 
+              Utils.hashPassword(loginForm.password) === c.password
+            );
+
+            if (client) {
+              if (client.status === 'pending') {
+                alert('Akun Anda masih menunggu persetujuan admin!');
+                return;
+              }
+              if (client.status === 'inactive') {
+                alert('Akun Anda telah dinonaktifkan!');
+                return;
+              }
+              setUserType('client');
+              setCurrentUser(client);
+              setView('client-dashboard');
+              setLoginForm({ username: '', password: '' });
+            } else {
+              alert('Email atau password salah!');
+            }
+          };
+
+          const handleRegister = () => {
+            if (!registerForm.name || !registerForm.businessName || !registerForm.email || !registerForm.password) {
+              alert('Mohon lengkapi semua field yang wajib diisi!');
+              return;
+            }
+
+            if (registerForm.password !== registerForm.confirmPassword) {
+              alert('Password dan konfirmasi password tidak sama!');
+              return;
+            }
+
+            if (registerForm.password.length < 6) {
+              alert('Password minimal 6 karakter!');
+              return;
+            }
+
+            // Check if email already exists
+            if (clients.some(c => c.email.toLowerCase() === registerForm.email.toLowerCase())) {
+              alert('Email sudah terdaftar!');
+              return;
+            }
+
+            const newClient = {
+              id: Utils.generateId(),
+              name: registerForm.name,
+              businessName: registerForm.businessName,
+              qrisName: registerForm.businessName.substring(0, 25),
+              phone: registerForm.phone,
+              email: registerForm.email,
+              address: registerForm.address,
+              password: Utils.hashPassword(registerForm.password),
+              status: 'pending', // pending, active, inactive
+              totalTransactions: 0,
+              totalRevenue: 0,
+              createdAt: new Date().toISOString()
+            };
+
+            const updatedClients = [...clients, newClient];
+            setClients(updatedClients);
+            Storage.saveClients(updatedClients);
+            
+            setRegisterForm({
+              name: '',
+              businessName: '',
+              phone: '',
+              email: '',
+              address: '',
+              password: '',
+              confirmPassword: ''
+            });
+            
+            alert('Registrasi berhasil! Silakan tunggu persetujuan admin untuk dapat login.');
+            setView('login');
+          };
+
+          const handleLogout = () => {
+            setUserType(null);
+            setCurrentUser(null);
+            setView('login');
+            setSelectedClient(null);
+            setModalType('');
+          };
+
+          // ============================================
+          // ADMIN - CLIENT MANAGEMENT
+          // ============================================
+          const handleApproveClient = (clientId) => {
+            const updatedClients = clients.map(c => 
+              c.id === clientId ? {...c, status: 'active'} : c
+            );
+            setClients(updatedClients);
+            Storage.saveClients(updatedClients);
+            alert('Client berhasil disetujui!');
+          };
+
+          const handleRejectClient = (clientId) => {
+            if (window.confirm('Yakin ingin menolak registrasi client ini?')) {
+              const updatedClients = clients.filter(c => c.id !== clientId);
+              setClients(updatedClients);
+              Storage.saveClients(updatedClients);
+              alert('Client berhasil ditolak!');
+            }
+          };
+
+          const handleToggleClientStatus = (clientId) => {
+            const clientToToggle = clients.find(c => c.id === clientId);
+            if (!clientToToggle) return;
+
+            if (clientToToggle.status === 'pending') {
+              alert('Client pending tidak bisa diubah statusnya, hanya bisa disetujui atau ditolak.');
+              return;
+            }
+
+            const newStatus = clientToToggle.status === 'active' ? 'inactive' : 'active';
+            const updatedClients = clients.map(c => 
+              c.id === clientId 
+                ? {...c, status: newStatus} 
+                : c
+            );
+            setClients(updatedClients);
+            Storage.saveClients(updatedClients);
+            alert(`Status client ${clientToToggle.name} diubah menjadi ${newStatus}.`);
+          };
+
+          // ============================================
+          // CLIENT - QRIS GENERATION
+          // ============================================
+          const handleClientGenerateQRIS = () => {
+            if (!masterSettings.masterQRIS) {
+              alert('Master QRIS belum diatur di pengaturan admin. Silakan hubungi admin!');
+              return;
+            }
+
+            if (!qrisForm.amount || isNaN(parseInt(qrisForm.amount)) || parseInt(qrisForm.amount) < CONFIG.MIN_TRANSACTION) {
+              alert(`Minimal transaksi ${Utils.formatCurrency(CONFIG.MIN_TRANSACTION)}`);
+              return;
+            }
+
+            const amount = parseInt(qrisForm.amount);
+            const adminFee = Utils.calculateFee(amount, masterSettings.adminFee);
+            const netAmount = amount - adminFee;
+
+            const transactionId = Utils.generateId();
+            const transaction = {
+              id: transactionId,
+              clientId: currentUser.id,
+              clientName: currentUser.name,
+              qrisDisplayName: currentUser.qrisName,
+              amount: amount,
+              adminFee: adminFee,
+              netAmount: netAmount,
+              description: qrisForm.description,
+              qrisCode: Utils.generateCustomQRIS(
+                masterSettings.masterQRIS,
+                currentUser.qrisName,
+                amount,
+                transactionId
+              ),
+              status: 'pending',
+              createdAt: new Date().toISOString()
+            };
+
+            Storage.saveTransaction(transaction);
+            setTransactions([transaction, ...transactions]);
+
+            // Update client stats
+            const updatedClients = clients.map(c => 
+              c.id === currentUser.id 
+                ? {...c, totalTransactions: (c.totalTransactions || 0) + 1}
+                : c
+            );
+            setClients(updatedClients);
+            Storage.saveClients(updatedClients);
+
+            // Update current user state
+            setCurrentUser({...currentUser, totalTransactions: (currentUser.totalTransactions || 0) + 1});
+
+            setQrisForm({ amount: '', description: '' });
+            setModalType('qr-display');
+            setSelectedClient({...currentUser, lastTransaction: transaction});
+            setShowModal(true);
+          };
+
+          // ============================================
+          // ADMIN - CONFIRM PAYMENT
+          // ============================================
+          const handleConfirmPayment = (transactionId) => {
+            const transaction = transactions.find(t => t.id === transactionId);
+            
+            if (window.confirm(`Konfirmasi pembayaran ${Utils.formatCurrency(transaction.amount)} untuk ${transaction.clientName}?`)) {
+              
+              Storage.updateTransaction(transactionId, { 
+                status: 'success', 
+                confirmedAt: new Date().toISOString()
+              });
+              
+              const updatedTransactions = transactions.map(t => 
+                t.id === transactionId ? {...t, status: 'success', confirmedAt: new Date().toISOString()} : t
+              );
+              setTransactions(updatedTransactions);
+
+              // Update client revenue
+              const updatedClients = clients.map(c => 
+                c.id === transaction.clientId 
+                  ? {...c, totalRevenue: (c.totalRevenue || 0) + transaction.netAmount}
+                  : c
+              );
+              setClients(updatedClients);
+              Storage.saveClients(updatedClients);
+
+              alert('Pembayaran berhasil dikonfirmasi dan revenue client telah diperbarui!');
+            }
+          };
+
+          // ============================================
+          // LOGIN/REGISTER VIEW
+          // ============================================
+          if (view === 'login' || view === 'register') {
+            return (
+              <div className="min-h-screen bg-gradient-to-br from-blue-500 via-purple-500 to-pink-500 flex items-center justify-center p-4">
+                <div className="max-w-md w-full">
+                  {/* Logo/Header */}
+                  <div className="text-center mb-8">
+                    <div className="inline-block p-4 bg-white rounded-full mb-4">
+                      <QrCode size={48} className="text-blue-600" />
+                    </div>
+                    <h1 className="text-4xl font-bold text-white mb-2">{CONFIG.APP_NAME}</h1>
+                    <p className="text-white/80">Gateway QRIS Multi-Client</p>
+                  </div>
+
+                  {view === 'login' ? (
+                    // LOGIN FORM
+                    <div className="bg-white rounded-2xl shadow-2xl p-8">
+                      <div className="flex gap-2 mb-6">
+                        <button
+                          onClick={() => setModalType('client-login')}
+                          className={`flex-1 py-3 rounded-lg font-semibold transition-all ${
+                            modalType === 'client-login'
+                              ? 'bg-blue-600 text-white shadow-md'
+                              : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+                          }`}
+                        >
+                          Login Client
+                        </button>
+                        <button
+                          onClick={() => setModalType('admin-login')}
+                          className={`flex-1 py-3 rounded-lg font-semibold transition-all ${
+                            modalType === 'admin-login'
+                              ? 'bg-purple-600 text-white shadow-md'
+                              : 'bg-gray-100 text-gray-600 hover:bg-gray-200'
+                          }`}
+                        >
+                          Login Admin
+                        </button>
+                      </div>
+
+                      {!modalType && (
+                        <div className="text-center py-8 text-gray-500">
+                          Pilih jenis login di atas
+                        </div>
+                      )}
+
+                      {modalType && (
+                        <>
+                          <div className="space-y-4 mb-6">
+                            <div>
+                              <label className="block text-sm font-semibold text-gray-700 mb-2">
+                                {modalType === 'admin-login' ? 'Username' : 'Email'}
+                              </label>
+                              <input
+                                type={modalType === 'admin-login' ? 'text' : 'email'}
+                                value={loginForm.username}
+                                onChange={(e) => setLoginForm({...loginForm, username: e.target.value})}
+                                className="w-full p-3 border rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                                placeholder={modalType === 'admin-login' ? 'admin' : 'email@example.com'}
+                              />
+                            </div>
+
+                            <div>
+                              <label className="block text-sm font-semibold text-gray-700 mb-2">
+                                Password
+                              </label>
+                              <input
+                                type="password"
+                                value={loginForm.password}
+                                onChange={(e) => setLoginForm({...loginForm, password: e.target.value})}
+                                className="w-full p-3 border rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                                placeholder="••••••••"
+                              />
+                            </div>
+                          </div>
+
+                          <button
+                            onClick={modalType === 'admin-login' ? handleAdminLogin : handleClientLogin}
+                            className={`w-full py-3 rounded-lg font-bold text-white mb-4 transition-all ${
+                              modalType === 'admin-login'
+                                ? 'bg-gradient-to-r from-purple-600 to-purple-700 hover:shadow-lg'
+                                : 'bg-gradient-to-r from-blue-600 to-blue-700 hover:shadow-lg'
+                            }`}
+                          >
+                            <div className="flex items-center justify-center gap-2">
+                              <LogIn size={20} />
+                              Login {modalType === 'admin-login' ? 'Admin' : 'Client'}
+                            </div>
+                          </button>
+
+                          {modalType === 'client-login' && (
+                            <div className="text-center">
+                              <span className="text-gray-600">Belum punya akun? </span>
+                              <button
+                                onClick={() => setView('register')}
+                                className="text-blue-600 font-semibold hover:underline"
+                              >
+                                Daftar di sini
+                              </button>
+                            </div>
+                          )}
+                        </>
+                      )}
+                    </div>
+                  ) : (
+                    // REGISTER FORM
+                    <div className="bg-white rounded-2xl shadow-2xl p-8 max-h-[85vh] overflow-y-auto">
+                      <div className="flex items-center gap-3 mb-6">
+                        <button
+                          onClick={() => setView('login')}
+                          className="p-2 hover:bg-gray-100 rounded-lg text-gray-700"
+                        >
+                          <ArrowLeft size={20} />
+                        </button>
+                        <div>
+                          <h2 className="text-2xl font-bold text-gray-800">Daftar Client Baru</h2>
+                          <p className="text-sm text-gray-600">Lengkapi data untuk registrasi</p>
+                        </div>
+                      </div>
+
+                      <div className="space-y-4">
+                        <div>
+                          <label className="block text-sm font-semibold text-gray-700 mb-2">
+                            Nama Lengkap *
+                          </label>
+                          <input
+                            type="text"
+                            value={registerForm.name}
+                            onChange={(e) => setRegisterForm({...registerForm, name: e.target.value})}
+                            className="w-full p-3 border rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                            placeholder="Nama lengkap Anda"
+                          />
+                        </div>
+
+                        <div>
+                          <label className="block text-sm font-semibold text-gray-700 mb-2">
+                            Nama Bisnis/Toko * (Maks 25 Karakter, akan tampil di QRIS)
+                          </label>
+                          <input
+                            type="text"
+                            value={registerForm.businessName}
+                            onChange={(e) => setRegisterForm({...registerForm, businessName: e.target.value})}
+                            className="w-full p-3 border rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                            placeholder="Contoh: Toko Maju Jaya"
+                            maxLength={25}
+                          />
+                          <p className="text-xs text-blue-600 mt-1">
+                            💡 Nama ini yang akan muncul saat customer scan QRIS
+                          </p>
+                        </div>
+
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                          <div>
+                            <label className="block text-sm font-semibold text-gray-700 mb-2">
+                              No. Telepon
+                            </label>
+                            <input
+                              type="tel"
+                              value={registerForm.phone}
+                              onChange={(e) => setRegisterForm({...registerForm, phone: e.target.value})}
+                              className="w-full p-3 border rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                              placeholder="08xxxxxxxxxx"
+                            />
+                          </div>
+
+                          <div>
+                            <label className="block text-sm font-semibold text-gray-700 mb-2">
+                              Email *
+                            </label>
+                            <input
+                              type="email"
+                              value={registerForm.email}
+                              onChange={(e) => setRegisterForm({...registerForm, email: e.target.value})}
+                              className="w-full p-3 border rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                              placeholder="email@example.com"
+                            />
+                          </div>
+                        </div>
+
+                        <div>
+                          <label className="block text-sm font-semibold text-gray-700 mb-2">
+                            Alamat
+                          </label>
+                          <textarea
+                            value={registerForm.address}
+                            onChange={(e) => setRegisterForm({...registerForm, address: e.target.value})}
+                            className="w-full p-3 border rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                            rows="2"
+                            placeholder="Alamat lengkap"
+                          />
+                        </div>
+
+                        <div>
+                          <label className="block text-sm font-semibold text-gray-700 mb-2">
+                            Password * (Min. 6 karakter)
+                          </label>
+                          <input
+                            type="password"
+                            value={registerForm.password}
+                            onChange={(e) => setRegisterForm({...registerForm, password: e.target.value})}
+                            className="w-full p-3 border rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                            placeholder="••••••••"
+                          />
+                        </div>
+
+                        <div>
+                          <label className="block text-sm font-semibold text-gray-700 mb-2">
+                            Konfirmasi Password *
+                          </label>
+                          <input
+                            type="password"
+                            value={registerForm.confirmPassword}
+                            onChange={(e) => setRegisterForm({...registerForm, confirmPassword: e.target.value})}
+                            className="w-full p-3 border rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                            placeholder="••••••••"
+                          />
+                        </div>
+                      </div>
+
+                      <button
+                        onClick={handleRegister}
+                        className="w-full bg-gradient-to-r from-blue-600 to-blue-700 text-white py-3 rounded-lg font-bold mt-6 hover:shadow-lg transition-all flex items-center justify-center gap-2"
+                      >
+                        <UserPlus size={20} />
+                        Daftar Sekarang
+                      </button>
+
+                      <div className="text-center mt-4">
+                        <span className="text-gray-600">Sudah punya akun? </span>
+                        <button
+                          onClick={() => setView('login')}
+                          className="text-blue-600 font-semibold hover:underline"
+                        >
+                          Login di sini
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
+            );
+          }
+
+          // ============================================
+          // CLIENT DASHBOARD VIEW
+          // ============================================
+          if (view === 'client-dashboard') {
+            return (
+              <div className="min-h-screen bg-gray-50">
+                {/* Header */}
+                <div className="bg-gradient-to-r from-blue-600 to-blue-800 text-white p-6 shadow-lg">
+                  <div className="max-w-7xl mx-auto">
+                    <div className="flex items-center justify-between mb-6">
+                      <div>
+                        <h1 className="text-3xl font-bold mb-1">Dashboard Client</h1>
+                        <p className="text-blue-100">Selamat datang, {currentUser.name}</p>
+                      </div>
+                      <button
+                        onClick={handleLogout}
+                        className="flex items-center gap-2 px-4 py-2 bg-white/20 rounded-lg hover:bg-white/30 transition-all"
+                      >
+                        <LogOut size={20} />
+                        Logout
+                      </button>
+                    </div>
+
+                    {/* Business Info */}
+                    <div className="bg-white/10 backdrop-blur-sm rounded-xl p-4 mb-4">
+                      <div className="text-sm text-blue-100 mb-1">Nama Bisnis Anda:</div>
+                      <div className="text-2xl font-bold">{currentUser.businessName}</div>
+                      <div className="text-sm text-blue-100 mt-2">Nama di QRIS: <span className="font-semibold">{currentUser.qrisName}</span></div>
+                    </div>
+
+                    {clientStats && (
+                    <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                      <div className="bg-white/10 backdrop-blur-sm rounded-xl p-4">
+                        <div className="text-blue-100 text-sm mb-1">Total Transaksi</div>
+                        <div className="text-3xl font-bold">{clientStats.myTransactions.length}</div>
+                      </div>
+                      <div className="bg-white/10 backdrop-blur-sm rounded-xl p-4">
+                        <div className="text-blue-100 text-sm mb-1">Berhasil</div>
+                        <div className="text-3xl font-bold text-green-300">{clientStats.successCount}</div>
+                      </div>
+                      <div className="bg-white/10 backdrop-blur-sm rounded-xl p-4">
+                        <div className="text-blue-100 text-sm mb-1">Pending</div>
+                        <div className="text-3xl font-bold text-yellow-300">{clientStats.pendingCount}</div>
+                      </div>
+                      <div className="bg-white/10 backdrop-blur-sm rounded-xl p-4">
+                        <div className="text-blue-100 text-sm mb-1">Total Revenue</div>
+                        <div className="text-xl font-bold">{Utils.formatCurrency(clientStats.totalRevenue)}</div>
+                      </div>
+                    </div>
+                    )}
+                  </div>
+                </div>
+
+                {/* Main Content */}
+                <div className="max-w-7xl mx-auto p-6">
+                  {/* Generate QRIS Section */}
+                  <div className="bg-white rounded-xl shadow-lg p-6 mb-6">
+                    <div className="flex items-center gap-3 mb-6">
+                      <QrCode className="text-green-600" size={32} />
+                      <div>
+                        <h2 className="text-2xl font-bold text-gray-800">Generate QRIS Baru</h2>
+                        <p className="text-sm text-gray-600">Buat QRIS untuk menerima pembayaran</p>
+                      </div>
+                    </div>
+
+                    <div className="grid md:grid-cols-2 gap-6">
+                      <div>
+                        <div className="space-y-4">
+                          <div>
+                            <label className="block text-sm font-semibold text-gray-700 mb-2">
+                              Nominal Transaksi *
+                            </label>
+                            <input
+                              type="number"
+                              value={qrisForm.amount}
+                              onChange={(e) => setQrisForm({...qrisForm, amount: e.target.value})}
+                              className="w-full p-4 border rounded-lg text-xl font-bold focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                              placeholder="0"
+                            />
+                            <p className="text-xs text-gray-500 mt-1">
+                              Minimal: {Utils.formatCurrency(CONFIG.MIN_TRANSACTION)}
+                            </p>
+                          </div>
+
+                          <div>
+                            <label className="block text-sm font-semibold text-gray-700 mb-2">
+                              Keterangan
+                            </label>
+                            <input
+                              type="text"
+                              value={qrisForm.description}
+                              onChange={(e) => setQrisForm({...qrisForm, description: e.target.value})}
+                              className="w-full p-3 border rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                              placeholder="Deskripsi transaksi..."
+                            />
+                          </div>
+                        </div>
+                      </div>
+
+                      <div>
+                        {qrisForm.amount && parseInt(qrisForm.amount) > 0 ? (
+                          <div className="bg-gradient-to-br from-green-50 to-blue-50 p-6 rounded-xl h-full flex flex-col justify-center">
+                            <h3 className="font-bold text-gray-800 mb-4">Rincian Transaksi:</h3>
+                            <div className="space-y-3">
+                              <div className="flex justify-between text-lg">
+                                <span className="text-gray-600">Nominal:</span>
+                                <span className="font-bold">{Utils.formatCurrency(parseInt(qrisForm.amount))}</span>
+                              </div>
+                              <div className="flex justify-between">
+                                <span className="text-gray-600">Fee Admin ({masterSettings.adminFee}%):</span>
+                                <span className="font-semibold text-red-600">
+                                  - {Utils.formatCurrency(Utils.calculateFee(parseInt(qrisForm.amount), masterSettings.adminFee))}
+                                </span>
+                              </div>
+                              <div className="flex justify-between text-xl font-bold pt-3 border-t-2">
+                                <span className="text-green-700">Anda Terima:</span>
+                                <span className="text-green-600">
+                                  {Utils.formatCurrency(parseInt(qrisForm.amount) - Utils.calculateFee(parseInt(qrisForm.amount), masterSettings.adminFee))}
+                                </span>
+                              </div>
+                            </div>
+                          </div>
+                        ) : (
+                          <div className="bg-gray-50 p-6 rounded-xl h-full flex items-center justify-center">
+                            <p className="text-gray-500 text-center">
+                              Masukkan nominal untuk melihat rincian
+                            </p>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+
+                    <button
+                      onClick={handleClientGenerateQRIS}
+                      disabled={!qrisForm.amount || parseInt(qrisForm.amount) < CONFIG.MIN_TRANSACTION || !masterSettings.masterQRIS}
+                      className="w-full bg-gradient-to-r from-green-500 to-green-600 text-white py-4 rounded-lg font-bold text-lg mt-6 hover:shadow-lg transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+                    >
+                      <QrCode size={24} />
+                      Generate QRIS Sekarang
+                    </button>
+                  </div>
+
+                  {/* My Transactions */}
+                  <div className="bg-white rounded-xl shadow-lg p-6">
+                    <div className="flex items-center justify-between mb-6">
+                      <div className="flex items-center gap-3">
+                        <Wallet className="text-blue-600" size={28} />
+                        <div>
+                          <h2 className="text-2xl font-bold text-gray-800">Transaksi Saya</h2>
+                          <p className="text-sm text-gray-600">Riwayat transaksi Anda</p>
+                        </div>
+                      </div>
+                    </div>
+
+                    {clientStats?.myTransactions?.length > 0 ? (
+                      <div className="space-y-3">
+                        {clientStats.myTransactions
+                            .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
+                            .map(transaction => (
+                          <div key={transaction.id} className="border rounded-lg p-4 hover:shadow-md transition-all">
+                            <div className="flex justify-between items-start">
+                              <div className="flex-1">
+                                <div className="font-bold text-gray-800 mb-1">{transaction.description || 'Transaksi QRIS'}</div>
+                                <div className="text-xs text-gray-500">
+                                  {new Date(transaction.createdAt).toLocaleString('id-ID')}
+                                </div>
+                                <div className="text-xs text-gray-500 mt-1 truncate max-w-[200px] md:max-w-none">
+                                  ID: {transaction.id}
+                                </div>
+                              </div>
+                              <div className="text-right">
+                                <div className="text-xl font-bold text-gray-800 mb-1">
+                                  {Utils.formatCurrency(transaction.amount)}
+                                </div>
+                                <div className="text-xs text-gray-600 mb-2">
+                                  Fee: {Utils.formatCurrency(transaction.adminFee)} | 
+                                  <span className="text-green-600 font-semibold"> Net: {Utils.formatCurrency(transaction.netAmount)}</span>
+                                </div>
+                                {transaction.status === 'pending' ? (
+                                  <span className="inline-block px-4 py-1 bg-yellow-100 text-yellow-700 rounded-lg text-sm font-semibold">
+                                    ⏳ Pending
+                                  </span>
+                                ) : (
+                                  <span className="inline-block px-4 py-1 bg-green-100 text-green-700 rounded-lg text-sm font-semibold">
+                                    ✅ Success
+                                  </span>
+                                )}
+                              </div>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="text-center py-12 text-gray-500">
+                        <Wallet size={64} className="mx-auto mb-4 opacity-50" />
+                        <p>Belum ada transaksi</p>
+                        <p className="text-sm mt-2">Generate QRIS pertama Anda di atas!</p>
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                {/* QR DISPLAY MODAL */}
+                {showModal && modalType === 'qr-display' && selectedClient?.lastTransaction && (
+                  <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+                    <div className="bg-white rounded-2xl p-6 max-w-2xl w-full max-h-[90vh] overflow-y-auto">
+                      <h3 className="text-2xl font-bold mb-2 text-center">QRIS Berhasil Dibuat!</h3>
+                      <p className="text-center text-gray-600 mb-6">Tunjukkan QR Code ini kepada customer</p>
+                      
+                      {/* QR Code Display */}
+                      <div className="bg-gradient-to-br from-blue-50 to-purple-50 p-6 rounded-2xl mb-6">
+                        <div className="bg-white p-6 rounded-xl shadow-lg mb-4">
+                          <div className="w-64 h-64 bg-gray-100 border-4 border-blue-500 rounded-xl mx-auto flex items-center justify-center mb-4">
+                            <QrCode size={180} className="text-blue-600" />
+                          </div>
+                          
+                          <div className="text-center mb-4">
+                            <div className="text-sm text-gray-600 mb-1">Nama Merchant:</div>
+                            <div className="text-xl font-bold text-blue-600">{selectedClient.lastTransaction.qrisDisplayName}</div>
+                          </div>
+
+                          <div className="bg-blue-50 p-4 rounded-lg">
+                            <div className="flex justify-between mb-2">
+                              <span className="text-sm text-gray-600">Nominal:</span>
+                              <span className="font-bold">{Utils.formatCurrency(selectedClient.lastTransaction.amount)}</span>
+                            </div>
+                            <div className="flex justify-between mb-2">
+                              <span className="text-sm text-gray-600">Fee Admin:</span>
+                              <span className="font-bold text-red-600">-{Utils.formatCurrency(selectedClient.lastTransaction.adminFee)}</span>
+                            </div>
+                            <div className="flex justify-between pt-2 border-t">
+                              <span className="font-bold">Anda Terima:</span>
+                              <span className="font-bold text-green-600">{Utils.formatCurrency(selectedClient.lastTransaction.netAmount)}</span>
+                            </div>
+                          </div>
+                        </div>
+
+                        <div className="grid grid-cols-2 gap-3">
+                          <button
+                            onClick={() => {
+                              navigator.clipboard.writeText(selectedClient.lastTransaction.qrisCode);
+                              alert('Kode QRIS berhasil disalin!');
+                            }}
+                            className="bg-blue-600 text-white py-3 rounded-lg font-semibold hover:bg-blue-700 flex items-center justify-center gap-2"
+                          >
+                            <Copy size={18} />
+                            Copy Code
+                          </button>
+                          <button
+                            onClick={() => alert('Fitur download QR akan segera tersedia')}
+                            className="bg-green-600 text-white py-3 rounded-lg font-semibold hover:bg-green-700 flex items-center justify-center gap-2"
+                          >
+                            <Download size={18} />
+                            Download
+                          </button>
+                        </div>
+                      </div>
+
+                      <div className="bg-yellow-50 p-4 rounded-xl mb-4">
+                        <div className="flex items-start gap-3">
+                          <div className="text-2xl">💡</div>
+                          <div className="text-sm text-yellow-900">
+                            <strong>Cara Menggunakan:</strong>
+                            <ol className="list-decimal ml-4 mt-2 space-y-1">
+                              <li>Customer scan QR Code ini dengan aplikasi DANA, OVO, GoPay, dll</li>
+                              <li>Akan muncul nama "{selectedClient.lastTransaction.qrisDisplayName}" di aplikasi customer</li>
+                              <li>Customer bayar sesuai nominal yang tertera</li>
+                              <li>Dana masuk ke rekening master admin</li>
+                              <li>Tunggu admin konfirmasi pembayaran</li>
+                              <li>Setelah dikonfirmasi, net amount akan ditransfer ke Anda</li>
+                            </ol>
+                          </div>
+                        </div>
+                      </div>
+
+                      <button
+                        onClick={() => {
+                          setShowModal(false);
+                          setSelectedClient(null);
+                        }}
+                        className="w-full bg-gray-600 text-white py-3 rounded-lg font-semibold hover:bg-gray-700"
+                      >
+                        Selesai
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            );
+          }
+
+          // ============================================
+          // ADMIN DASHBOARD VIEW
+          // ============================================
+          if (view === 'dashboard') {
+            const pendingClients = clients.filter(c => c.status === 'pending');
+            
+            return (
+              <div className="min-h-screen bg-gray-50">
+                {/* Header */}
+                <div className="bg-gradient-to-r from-purple-600 to-purple-800 text-white p-6 shadow-lg">
+                  <div className="max-w-7xl mx-auto">
+                    <div className="flex items-center justify-between mb-6">
+                      <div>
+                        <h1 className="text-3xl font-bold mb-1">{CONFIG.APP_NAME} - Admin</h1>
+                        <p className="text-purple-100">Kelola QRIS Client dengan Mudah</p>
+                      </div>
+                      <div className="flex gap-3">
+                        <button
+                          onClick={() => setView('settings')}
+                          className="w-12 h-12 bg-white/20 rounded-full flex items-center justify-center hover:bg-white/30 transition-all"
+                        >
+                          <Settings size={24} />
+                        </button>
+                        <button
+                          onClick={handleLogout}
+                          className="flex items-center gap-2 px-4 py-2 bg-white/20 rounded-lg hover:bg-white/30 transition-all"
+                        >
+                          <LogOut size={20} />
+                          Logout
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Stats Grid */}
+                    <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                      <div className="bg-white/10 backdrop-blur-sm rounded-xl p-4">
+                        <div className="text-purple-100 text-sm mb-1">Total Client</div>
+                        <div className="text-3xl font-bold">{stats.totalClients}</div>
+                        {pendingClients.length > 0 && (
+                          <div className="text-xs text-yellow-300 mt-1">{pendingClients.length} pending</div>
+                        )}
+                      </div>
+                      <div className="bg-white/10 backdrop-blur-sm rounded-xl p-4">
+                        <div className="text-purple-100 text-sm mb-1">Transaksi</div>
+                        <div className="text-3xl font-bold">{stats.totalTransactions}</div>
+                      </div>
+                      <div className="bg-white/10 backdrop-blur-sm rounded-xl p-4">
+                        <div className="text-purple-100 text-sm mb-1">Revenue Client</div>
+                        <div className="text-xl font-bold">{Utils.formatCurrency(stats.totalRevenue)}</div>
+                      </div>
+                      <div className="bg-white/10 backdrop-blur-sm rounded-xl p-4">
+                        <div className="text-purple-100 text-sm mb-1">Total Fee Anda</div>
+                        <div className="text-xl font-bold text-green-300">{Utils.formatCurrency(stats.totalFees)}</div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Main Content */}
+                <div className="max-w-7xl mx-auto p-6">
+                  {/* Pending Approvals */}
+                  {pendingClients.length > 0 && (
+                    <div className="bg-yellow-50 border-2 border-yellow-400 rounded-xl shadow-lg p-6 mb-6">
+                      <div className="flex items-center gap-3 mb-4">
+                        <div className="w-12 h-12 bg-yellow-400 rounded-full flex items-center justify-center">
+                          <UserPlus className="text-white" size={24} />
+                        </div>
+                        <div>
+                          <h2 className="text-2xl font-bold text-yellow-900">Registrasi Baru</h2>
+                          <p className="text-sm text-yellow-800">{pendingClients.length} client menunggu persetujuan</p>
+                        </div>
+                      </div>
+
+                      <div className="space-y-3">
+                        {pendingClients.map(client => (
+                          <div key={client.id} className="bg-white rounded-lg p-4 border border-yellow-300">
+                            <div className="flex justify-between items-start">
+                              <div className="flex-1">
+                                <h3 className="font-bold text-lg text-gray-800">{client.name}</h3>
+                                <p className="text-sm text-gray-600 mb-1">{client.businessName}</p>
+                                <div className="text-xs text-gray-500">
+                                  <div>📧 {client.email}</div>
+                                  {client.phone && <div>📱 {client.phone}</div>}
+                                  {client.address && <div>📍 {client.address}</div>}
+                                </div>
+                                <div className="text-xs text-gray-400 mt-2">
+                                  Daftar: {new Date(client.createdAt).toLocaleString('id-ID')}
+                                </div>
+                              </div>
+                              <div className="flex gap-2">
+                                <button
+                                  onClick={() => handleApproveClient(client.id)}
+                                  className="px-4 py-2 bg-green-500 text-white rounded-lg font-semibold hover:bg-green-600 flex items-center gap-2 text-sm"
+                                >
+                                  <Check size={16} />
+                                  Setujui
+                                </button>
+                                <button
+                                  onClick={() => handleRejectClient(client.id)}
+                                  className="px-4 py-2 bg-red-500 text-white rounded-lg font-semibold hover:bg-red-600 flex items-center gap-2 text-sm"
+                                >
+                                  <Trash2 size={16} />
+                                  Tolak
+                                </button>
+                              </div>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Active Clients */}
+                  <div className="bg-white rounded-xl shadow-lg p-6 mb-6">
+                    <div className="flex items-center justify-between mb-6">
+                      <div className="flex items-center gap-3">
+                        <Users className="text-purple-600" size={28} />
+                        <div>
+                          <h2 className="text-2xl font-bold text-gray-800">Kelola Client</h2>
+                          <p className="text-sm text-gray-600">{stats.activeClients} client aktif</p>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Search */}
+                    <div className="mb-4">
+                      <div className="relative">
+                        <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-400" size={20} />
+                        <input
+                          type="text"
+                          placeholder="Cari client berdasarkan nama/bisnis..."
+                          value={searchTerm}
+                          onChange={(e) => setSearchTerm(e.target.value)}
+                          className="w-full pl-10 pr-4 py-3 border rounded-lg focus:outline-none focus:ring-2 focus:ring-purple-500"
+                        />
+                      </div>
+                    </div>
+
+                    {/* Clients Grid */}
+                    {clients.filter(c => c.status !== 'pending').length > 0 ? (
+                      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                        {clients
+                          .filter(c => c.status !== 'pending')
+                          .filter(c => 
+                            c.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
+                            c.businessName.toLowerCase().includes(searchTerm.toLowerCase())
+                          )
+                          .map(client => (
+                            <div key={client.id} className={`border rounded-xl p-5 hover:shadow-lg transition-all ${
+                              client.status === 'active' 
+                                ? 'bg-gradient-to-br from-white to-purple-50 border-purple-200' 
+                                : 'bg-gray-100 border-gray-300'
+                            }`}>
+                              <div className="flex justify-between items-start mb-4">
+                                <div className="flex-1">
+                                  <h3 className="font-bold text-lg text-gray-800">{client.name}</h3>
+                                  <p className="text-sm text-gray-600 mb-2">{client.businessName} (QRIS: {client.qrisName})</p>
+                                  <div className={`inline-block px-3 py-1 rounded-full text-xs font-semibold ${
+                                    client.status === 'active'
+                                      ? 'bg-green-100 text-green-700'
+                                      : 'bg-gray-200 text-gray-700'
+                                  }`}>
+                                    {client.status === 'active' ? '✓ Aktif' : '✗ Nonaktif'}
+                                  </div>
+                                </div>
+                                <button
+                                  onClick={() => handleToggleClientStatus(client.id)}
+                                  className={`p-2 rounded-lg ${
+                                    client.status === 'active'
+                                      ? 'text-orange-600 hover:bg-orange-100'
+                                      : 'text-green-600 hover:bg-green-100'
+                                  }`}
+                                  title={client.status === 'active' ? 'Nonaktifkan' : 'Aktifkan'}
+                                >
+                                  <Settings size={16} />
+                                </button>
+                              </div>
+
+                              <div className="space-y-2 mb-4 text-sm">
+                                <div className="flex justify-between">
+                                  <span className="text-gray-600">Total Transaksi:</span>
+                                  <span className="font-semibold">{client.totalTransactions}</span>
+                                </div>
+                                <div className="flex justify-between">
+                                  <span className="text-gray-600">Total Revenue:</span>
+                                  <span className="font-semibold text-green-600">
+                                    {Utils.formatCurrency(client.totalRevenue || 0)}
+                                  </span>
+                                </div>
+                                <div className="text-xs text-gray-500">
+                                  📧 {client.email}
+                                </div>
+                              </div>
+                            </div>
+                          ))}
+                      </div>
+                    ) : (
+                      <div className="text-center py-12">
+                        <Users size={64} className="text-gray-300 mx-auto mb-4" />
+                        <p className="text-gray-500 text-lg mb-4">Belum ada client aktif</p>
+                        <p className="text-sm text-gray-400">Client akan muncul di sini setelah registrasi disetujui</p>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Recent Transactions */}
+                  <div className="bg-white rounded-xl shadow-lg p-6">
+                    <div className="flex items-center justify-between mb-6">
+                      <div className="flex items-center gap-3">
+                        <Wallet className="text-green-600" size={28} />
+                        <div>
+                          <h2 className="text-2xl font-bold text-gray-800">Transaksi Terbaru</h2>
+                          <p className="text-sm text-gray-600">Monitor transaksi client Anda</p>
+                        </div>
+                      </div>
+                      {stats.pendingTransactions > 0 && (
+                        <span className="bg-yellow-100 text-yellow-800 px-4 py-2 rounded-full text-sm font-semibold">
+                          {stats.pendingTransactions} Pending
+                        </span>
+                      )}
+                    </div>
+
+                    {transactions.length > 0 ? (
+                      <div className="space-y-3">
+                        {transactions
+                            .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))
+                            .slice(0, 10).map(transaction => (
+                          <div key={transaction.id} className="border rounded-lg p-4 hover:shadow-md transition-all">
+                            <div className="flex justify-between items-start">
+                              <div className="flex-1">
+                                <div className="flex items-center gap-3 mb-2">
+                                  <div className="font-bold text-gray-800">{transaction.clientName}</div>
+                                  <div className="text-xs px-3 py-1 rounded-full bg-purple-50 text-purple-700 font-semibold">
+                                    {transaction.qrisDisplayName}
+                                  </div>
+                                </div>
+                                <div className="text-sm text-gray-600 mb-1">{transaction.description || 'Transaksi QRIS'}</div>
+                                <div className="text-xs text-gray-500">
+                                  {new Date(transaction.createdAt).toLocaleString('id-ID')}
+                                </div>
+                              </div>
+                              <div className="text-right">
+                                <div className="text-xl font-bold text-gray-800 mb-1">
+                                  {Utils.formatCurrency(transaction.amount)}
+                                </div>
+                                <div className="text-xs text-gray-600 mb-2">
+                                  Fee: <span className="text-red-600 font-semibold">{Utils.formatCurrency(transaction.adminFee)}</span> | 
+                                  Net: <span className="text-blue-600 font-semibold">{Utils.formatCurrency(transaction.netAmount)}</span>
+                                </div>
+                                {transaction.status === 'pending' ? (
+                                  <button
+                                    onClick={() => handleConfirmPayment(transaction.id)}
+                                    className="bg-green-500 text-white px-4 py-1 rounded-lg text-sm font-semibold hover:bg-green-600 mt-1"
+                                  >
+                                    Konfirmasi
+                                  </button>
+                                ) : (
+                                  <span className="inline-block px-4 py-1 bg-green-100 text-green-700 rounded-lg text-sm font-semibold mt-1">
+                                    ✅ Success
+                                  </span>
+                                )}
+                              </div>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="text-center py-12 text-gray-500">
+                        <Wallet size={64} className="mx-auto mb-4 opacity-50" />
+                        <p>Belum ada transaksi</p>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            );
+          }
+
+          // ============================================
+          // SETTINGS VIEW
+          // ============================================
+          if (view === 'settings') {
+            return (
+              <div className="min-h-screen bg-gray-50">
+                <div className="bg-gradient-to-r from-gray-700 to-gray-900 text-white p-6 shadow-lg">
+                  <div className="max-w-4xl mx-auto">
+                    <button
+                      onClick={() => setView('dashboard')}
+                      className="flex items-center gap-2 text-white/80 hover:text-white mb-4"
+                    >
+                      <ArrowLeft size={20} />
+                      Kembali
+                    </button>
+                    <h1 className="text-3xl font-bold">Pengaturan Master</h1>
+                    <p className="text-gray-300">Konfigurasi QRIS master dan fee admin</p>
+                  </div>
+                </div>
+
+                <div className="max-w-4xl mx-auto p-6">
+                  <div className="bg-white rounded-xl shadow-lg p-6">
+                    <div className="space-y-6">
+                      <div>
+                        <label className="block text-sm font-semibold text-gray-700 mb-2">
+                          Nama Merchant Master
+                        </label>
+                        <input
+                          type="text"
+                          value={masterSettings.merchantName}
+                          onChange={(e) => setMasterSettings({...masterSettings, merchantName: e.target.value})}
+                          className="w-full p-3 border rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                          placeholder="Nama bisnis Anda"
+                        />
+                      </div>
+
+                      <div>
+                        <label className="block text-sm font-semibold text-gray-700 mb-2">
+                          Master QRIS Code
+                        </label>
+                        <textarea
+                          value={masterSettings.masterQRIS}
+                          onChange={(e) => setMasterSettings({...masterSettings, masterQRIS: e.target.value})}
+                          className="w-full p-3 border rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none font-mono text-sm"
+                          rows="6"
+                          placeholder="Paste QRIS master code Anda di sini"
+                        />
+                        <p className="text-sm text-gray-600 mt-2">
+                          💡 Ini adalah QRIS utama Anda. Semua pembayaran dari client akan masuk ke rekening ini.
+                        </p>
+                      </div>
+
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <div>
+                          <label className="block text-sm font-semibold text-gray-700 mb-2">
+                            Nama Bank/E-Wallet
+                          </label>
+                          <input
+                            type="text"
+                            value={masterSettings.bankName}
+                            onChange={(e) => setMasterSettings({...masterSettings, bankName: e.target.value})}
+                            className="w-full p-3 border rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                            placeholder="Contoh: DANA, OVO, BCA"
+                          />
+                        </div>
+
+                        <div>
+                          <label className="block text-sm font-semibold text-gray-700 mb-2">
+                            Nomor Rekening/HP
+                          </label>
+                          <input
+                            type="text"
+                            value={masterSettings.accountNumber}
+                            onChange={(e) => setMasterSettings({...masterSettings, accountNumber: e.target.value})}
+                            className="w-full p-3 border rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                            placeholder="1234567890"
+                          />
+                        </div>
+                      </div>
+
+                      <div>
+                        <label className="block text-sm font-semibold text-gray-700 mb-2">
+                          Fee Admin (%)
+                        </label>
+                        <input
+                          type="number"
+                          value={masterSettings.adminFee}
+                          onChange={(e) => setMasterSettings({...masterSettings, adminFee: parseFloat(e.target.value)})}
+                          className="w-full p-3 border rounded-lg focus:ring-2 focus:ring-blue-500 focus:outline-none"
+                          min="0"
+                          max="100"
+                          step="0.1"
+                        />
+                        <p className="text-sm text-gray-600 mt-2">
+                          Persentase fee yang akan Anda ambil dari setiap transaksi client. Saat ini: **{masterSettings.adminFee}%**
+                        </p>
+                      </div>
+
+                      <div className="bg-blue-50 p-4 rounded-xl">
+                        <h4 className="font-bold text-blue-900 mb-2">Cara Kerja Sistem:</h4>
+                        <ul className="text-sm text-blue-800 space-y-2">
+                          <li className="flex gap-2">
+                            <span>1️⃣</span>
+                            <span>Client mendaftar dan menunggu persetujuan Anda</span>
+                          </li>
+                          <li className="flex gap-2">
+                            <span>2️⃣</span>
+                            <span>Setelah disetujui, client bisa login dan membuat QRIS sendiri</span>
+                          </li>
+                          <li className="flex gap-2">
+                            <span>3️⃣</span>
+                            <span>Client input nominal dan generate QRIS dengan nama bisnis mereka</span>
+                          </li>
+                          <li className="flex gap-2">
+                            <span>4️⃣</span>
+                            <span>Customer scan QRIS dan bayar, uang masuk ke rekening Anda</span>
+                          </li>
+                          <li className="flex gap-2">
+                            <span>5️⃣</span>
+                            <span>Anda konfirmasi pembayaran dan transfer net amount ke client</span>
+                          </li>
+                        </ul>
+                      </div>
+
+                      <button
+                        onClick={() => {
+                          Storage.saveMasterSettings(masterSettings);
+                          alert('Pengaturan berhasil disimpan!');
+                          setView('dashboard');
+                        }}
+                        className="w-full bg-gradient-to-r from-blue-600 to-blue-700 text-white py-4 rounded-lg font-bold text-lg hover:shadow-lg transition-all"
+                      >
+                        Simpan Pengaturan
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Info Card */}
+                  <div className="bg-gradient-to-r from-purple-500 to-pink-500 text-white rounded-xl shadow-lg p-6 mt-6">
+                    <h3 className="text-xl font-bold mb-3">🎯 Keuntungan Sistem Ini:</h3>
+                    <ul className="space-y-2 text-sm">
+                      <li>✅ Client registrasi sendiri, Anda tinggal approve</li>
+                      <li>✅ Client buat QRIS sendiri dengan nominal mereka</li>
+                      <li>✅ Client punya QRIS dengan nama bisnis sendiri</li>
+                      <li>✅ Uang tetap masuk ke rekening Anda</li>
+                      <li>✅ Fee otomatis terpotong</li>
+                      <li>✅ Client tidak perlu rekening merchant</li>
+                      <li>✅ Mudah kelola banyak client</li>
+                    </ul>
+                  </div>
+
+                  {/* Login Info */}
+                  <div className="bg-gray-800 text-white rounded-xl shadow-lg p-6 mt-6">
+                    <h3 className="text-xl font-bold mb-3">🔐 Info Login:</h3>
+                    <div className="space-y-2 text-sm">
+                      <div className="bg-white/10 p-3 rounded-lg">
+                        <div className="font-semibold mb-1">Admin:</div>
+                        <div>Username: <span className="font-mono bg-black/30 px-2 py-1 rounded">admin</span></div>
+                        <div>Password: <span className="font-mono bg-black/30 px-2 py-1 rounded">admin123</span></div>
+                      </div>
+                      <div className="bg-white/10 p-3 rounded-lg">
+                        <div className="font-semibold mb-1">Client:</div>
+                        <div>Login menggunakan email dan password yang didaftarkan (default status **pending**)</div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            );
+          }
+
+          return null;
+        }
+
+        // Render the React component
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<QRISGatewayApp />);
+    </script>
+</body>
+</html>
